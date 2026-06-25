@@ -1,5 +1,6 @@
 # functions_documents.py that has some changes I need to merge into Development
 
+import re
 import traceback
 from config import *
 from functions_content import *
@@ -20,6 +21,7 @@ def allowed_file(filename, allowed_extensions=None):
 ARCHIVED_SCOPE_PREFIX = "__archived__::"
 CURRENT_ALIAS_BLOB_PATH_MODE = "current_alias"
 ARCHIVED_REVISION_BLOB_PATH_MODE = "archived_revision"
+TAG_COLOR_PATTERN = re.compile(r'^#?(?:[0-9a-fA-F]{3}|[0-9a-fA-F]{6})$')
 
 
 def _get_blob_container_name(group_id=None, public_workspace_id=None):
@@ -92,6 +94,27 @@ def get_document_blob_storage_info(document_item, user_id=None, group_id=None, p
         group_id=group_id or document_item.get("group_id"),
         public_workspace_id=public_workspace_id or document_item.get("public_workspace_id"),
     )
+
+
+def _has_persisted_blob_reference(document_item):
+    if not document_item:
+        return False
+
+    if document_item.get("blob_path"):
+        return True
+
+    return (
+        document_item.get("blob_path_mode") == ARCHIVED_REVISION_BLOB_PATH_MODE
+        and bool(document_item.get("archived_blob_path"))
+    )
+
+
+def _normalize_document_enhanced_citations(document_item):
+    if not document_item:
+        return document_item
+
+    document_item["enhanced_citations"] = _has_persisted_blob_reference(document_item)
+    return document_item
 
 
 def get_document_blob_delete_targets(document_item, user_id=None, group_id=None, public_workspace_id=None):
@@ -317,7 +340,9 @@ def select_current_documents(documents):
 
     current_documents = []
     for family_documents in families.values():
-        current_documents.append(_choose_current_document(family_documents))
+        current_documents.append(
+            _normalize_document_enhanced_citations(_choose_current_document(family_documents))
+        )
 
     return current_documents
 
@@ -666,6 +691,7 @@ def create_document(file_name, user_id, document_id, num_file_chunks, status, gr
                 "status": status,
                 "percentage_complete": 0,
                 "document_classification": carried_forward.get("document_classification", "None"),
+                "enhanced_citations": False,
                 "type": "document_metadata",
                 "public_workspace_id": public_workspace_id,
                 "user_id": user_id,
@@ -697,6 +723,7 @@ def create_document(file_name, user_id, document_id, num_file_chunks, status, gr
                 "status": status,
                 "percentage_complete": 0,
                 "document_classification": carried_forward.get("document_classification", "None"),
+                "enhanced_citations": False,
                 "type": "document_metadata",
                 "group_id": group_id,
                 "blob_container": _get_blob_container_name(group_id=group_id),
@@ -728,6 +755,7 @@ def create_document(file_name, user_id, document_id, num_file_chunks, status, gr
                 "status": status,
                 "percentage_complete": 0,
                 "document_classification": carried_forward.get("document_classification", "None"),
+                "enhanced_citations": False,
                 "type": "document_metadata",
                 "user_id": user_id,
                 "blob_container": _get_blob_container_name(),
@@ -823,7 +851,7 @@ def get_document_metadata(document_id, user_id, group_id=None, public_workspace_
             user_id=public_workspace_id if is_public_workspace else (group_id if is_group else user_id),
             content=f"Document metadata retrieved: {document_items}."
         )
-        return document_items[0] if document_items else None
+        return _normalize_document_enhanced_citations(document_items[0]) if document_items else None
 
     except Exception as e:
         print(f"Error retrieving document metadata: {repr(e)}\nTraceback:\n{traceback.format_exc()}")
@@ -2775,7 +2803,7 @@ def get_document(user_id, document_id, group_id=None, public_workspace_id=None):
         if not document_results:
             return jsonify({'error': 'Document not found or access denied'}), 404
 
-        return jsonify(document_results[0]), 200
+        return jsonify(_normalize_document_enhanced_citations(document_results[0])), 200
 
     except Exception as e:
         return jsonify({'error': f'Error retrieving document: {str(e)}'}), 500
@@ -2863,7 +2891,7 @@ def get_document_version(user_id, document_id, version, group_id=None, public_wo
         if not document_results:
             return jsonify({'error': 'Document version not found'}), 404
 
-        return jsonify(document_results[0]), 200
+        return jsonify(_normalize_document_enhanced_citations(document_results[0])), 200
 
     except Exception as e:
         return jsonify({'error': f'Error retrieving document version: {str(e)}'}), 500
@@ -4158,6 +4186,7 @@ def upload_to_blob(temp_file_path, user_id, document_id, blob_filename, update_c
         current_document["blob_container"] = storage_account_container_name
         current_document["blob_path"] = blob_path
         current_document["blob_path_mode"] = CURRENT_ALIAS_BLOB_PATH_MODE
+        current_document["enhanced_citations"] = True
         if current_document.get("archived_blob_path") is None:
             current_document["archived_blob_path"] = None
         cosmos_container.upsert_item(current_document)
@@ -6242,6 +6271,34 @@ def _get_speech_config(settings, endpoint: str, locale: str):
     print(f"[Debug] Speech config obtained successfully", flush=True)
     return speech_config
 
+
+def get_speech_synthesis_config(settings, endpoint: str, location: str):
+    """Get speech synthesis config for either key or managed identity auth."""
+    auth_type = settings.get("speech_service_authentication_type")
+
+    if auth_type == "managed_identity":
+        resource_id = (settings.get("speech_service_resource_id") or "").strip()
+        if not location:
+            raise ValueError("Speech service location is required for text-to-speech with managed identity.")
+        if not resource_id:
+            raise ValueError("Speech service resource ID is required for text-to-speech with managed identity.")
+
+        credential = DefaultAzureCredential()
+        token = credential.get_token(cognitive_services_scope)
+        authorization_token = f"aad#{resource_id}#{token.token}"
+        speech_config = speechsdk.SpeechConfig(auth_token=authorization_token, region=location)
+    else:
+        key = (settings.get("speech_service_key") or "").strip()
+        if not endpoint:
+            raise ValueError("Speech service endpoint is required for text-to-speech.")
+        if not key:
+            raise ValueError("Speech service key is required for text-to-speech when using key authentication.")
+
+        speech_config = speechsdk.SpeechConfig(endpoint=endpoint, subscription=key)
+
+    print(f"[Debug] Speech synthesis config obtained successfully", flush=True)
+    return speech_config
+
 def process_audio_document(
     document_id: str,
     user_id: str,
@@ -7511,6 +7568,58 @@ def sanitize_tags_for_filter(raw_tags):
     return valid_tags
 
 
+def normalize_tag_color(color):
+    """
+    Normalize a tag color to a canonical 6-digit lowercase hex code.
+    Returns None for invalid values.
+    """
+    if not isinstance(color, str):
+        return None
+
+    normalized_color = color.strip()
+    if not normalized_color:
+        return None
+
+    if not TAG_COLOR_PATTERN.fullmatch(normalized_color):
+        return None
+
+    if not normalized_color.startswith('#'):
+        normalized_color = f'#{normalized_color}'
+
+    if len(normalized_color) == 4:
+        normalized_color = '#' + ''.join(component * 2 for component in normalized_color[1:])
+
+    return normalized_color.lower()
+
+
+def get_safe_tag_color(color, tag_name):
+    """
+    Return a normalized tag color or the deterministic default for the tag.
+    """
+    normalized_color = normalize_tag_color(color)
+    if normalized_color:
+        return normalized_color
+
+    safe_tag_name = normalize_tag(tag_name) or str(tag_name or '')
+    return get_default_tag_color(safe_tag_name)
+
+
+def validate_tag_color(color, tag_name):
+    """
+    Validate a requested tag color.
+    Returns (is_valid, error_message, normalized_color).
+    Missing colors resolve to the deterministic default for the tag.
+    """
+    if color is None:
+        return True, None, get_safe_tag_color(None, tag_name)
+
+    normalized_color = normalize_tag_color(color)
+    if not normalized_color:
+        return False, 'Tag color must be a valid 3- or 6-digit hex color', None
+
+    return True, None, normalized_color
+
+
 def get_workspace_tags(user_id, group_id=None, public_workspace_id=None):
     """
     Get all unique tags used in a workspace with document counts.
@@ -7607,7 +7716,7 @@ def get_workspace_tags(user_id, group_id=None, public_workspace_id=None):
             results.append({
                 'name': tag_name,
                 'count': count,
-                'color': tag_def.get('color', get_default_tag_color(tag_name))
+                'color': get_safe_tag_color(tag_def.get('color'), tag_name)
             })
         
         # Add defined tags that haven't been used yet (count = 0)
@@ -7616,7 +7725,7 @@ def get_workspace_tags(user_id, group_id=None, public_workspace_id=None):
                 results.append({
                     'name': tag_name,
                     'count': 0,
-                    'color': tag_def.get('color', get_default_tag_color(tag_name))
+                    'color': get_safe_tag_color(tag_def.get('color'), tag_name)
                 })
 
         # Sort by count descending, then name ascending
@@ -7673,34 +7782,40 @@ def get_or_create_tag_definition(user_id, tag_name, workspace_type='personal', c
     """
     from datetime import datetime, timezone
 
+    safe_color = get_safe_tag_color(color, tag_name)
+
     if workspace_type == 'group' and group_id:
         from functions_group import find_group_by_id
         group_doc = find_group_by_id(group_id)
         if not group_doc:
-            return {'color': color or get_default_tag_color(tag_name)}
+            return {'color': safe_color}
         tag_defs = group_doc.get('tag_definitions', {})
         if tag_name not in tag_defs:
             tag_defs[tag_name] = {
-                'color': color if color else get_default_tag_color(tag_name),
+                'color': safe_color,
                 'created_at': datetime.now(timezone.utc).isoformat()
             }
             group_doc['tag_definitions'] = tag_defs
             cosmos_groups_container.upsert_item(group_doc)
-        return tag_defs[tag_name]
+        stored_tag_def = dict(tag_defs[tag_name])
+        stored_tag_def['color'] = get_safe_tag_color(stored_tag_def.get('color'), tag_name)
+        return stored_tag_def
     elif workspace_type == 'public' and public_workspace_id:
         from functions_public_workspaces import find_public_workspace_by_id
         ws_doc = find_public_workspace_by_id(public_workspace_id)
         if not ws_doc:
-            return {'color': color or get_default_tag_color(tag_name)}
+            return {'color': safe_color}
         tag_defs = ws_doc.get('tag_definitions', {})
         if tag_name not in tag_defs:
             tag_defs[tag_name] = {
-                'color': color if color else get_default_tag_color(tag_name),
+                'color': safe_color,
                 'created_at': datetime.now(timezone.utc).isoformat()
             }
             ws_doc['tag_definitions'] = tag_defs
             cosmos_public_workspaces_container.upsert_item(ws_doc)
-        return tag_defs[tag_name]
+        stored_tag_def = dict(tag_defs[tag_name])
+        stored_tag_def['color'] = get_safe_tag_color(stored_tag_def.get('color'), tag_name)
+        return stored_tag_def
     else:
         # Personal: store in user settings
         from functions_settings import get_user_settings, update_user_settings
@@ -7716,12 +7831,14 @@ def get_or_create_tag_definition(user_id, tag_name, workspace_type='personal', c
 
         if tag_name not in workspace_tags:
             workspace_tags[tag_name] = {
-                'color': color if color else get_default_tag_color(tag_name),
+                'color': safe_color,
                 'created_at': datetime.now(timezone.utc).isoformat()
             }
             update_user_settings(user_id, {'tag_definitions': tag_definitions})
 
-        return workspace_tags[tag_name]
+        stored_tag_def = dict(workspace_tags[tag_name])
+        stored_tag_def['color'] = get_safe_tag_color(stored_tag_def.get('color'), tag_name)
+        return stored_tag_def
 
 
 def propagate_tags_to_blob_metadata(document_id, tags, user_id, group_id=None, public_workspace_id=None):
